@@ -1,0 +1,392 @@
+Para implementar o envio de arquivos, gravação de áudio e exclusão de mensagens, precisaremos fazer alterações em três frentes:
+
+1.  **Banco de Dados:** Adicionar colunas para suportar tipos de mensagem (arquivo/áudio) e identificar o arquivo.
+2.  **Novo Módulo (`chat_media.py`):** Criar um arquivo separado para lidar com a lógica de gravar áudio e salvar arquivos (para não poluir seu `app.py`).
+3.  **Atualização no `app.py`:** Modificar a interface gráfica e as funções de banco de dados.
+
+-----
+
+### Passo 0: Instalação de Bibliotecas
+
+Você precisará de bibliotecas para lidar com áudio e arquivos. No terminal, execute:
+
+```bash
+pip install sounddevice soundfile numpy
+```
+
+-----
+
+### Passo 1: Atualização do Banco de Dados (SQL)
+
+Você precisa executar estes comandos no seu banco MySQL para preparar a tabela `Mensagem`. Se não fizer isso, o código dará erro.
+
+```sql
+ALTER TABLE Mensagem 
+ADD COLUMN tipo ENUM('texto', 'arquivo', 'audio') DEFAULT 'texto',
+ADD COLUMN caminho_arquivo VARCHAR(255) DEFAULT NULL;
+```
+
+-----
+
+### Passo 2: Novo Módulo (`chat_media.py`)
+
+Crie um novo arquivo chamado `chat_media.py` na mesma pasta do seu projeto. Ele vai cuidar da gravação de áudio e cópia de arquivos.
+
+```python
+import os
+import shutil
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
+from datetime import datetime
+
+# Pasta onde os arquivos serão salvos localmente
+UPLOAD_FOLDER = "chat_uploads"
+
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+class AudioRecorder:
+    def __init__(self):
+        self.recording = False
+        self.audio_data = []
+        self.sample_rate = 44100
+        self.stream = None
+
+    def start_recording(self):
+        self.recording = True
+        self.audio_data = []
+        # Callback para capturar áudio em tempo real
+        def callback(indata, frames, time, status):
+            if self.recording:
+                self.audio_data.append(indata.copy())
+        
+        self.stream = sd.InputStream(samplerate=self.sample_rate, channels=1, callback=callback)
+        self.stream.start()
+
+    def stop_recording(self):
+        self.recording = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        
+        if not self.audio_data:
+            return None
+
+        # Salvar arquivo
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"audio_{timestamp}.wav"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        
+        # Juntar os pedaços de áudio e salvar
+        my_recording = np.concatenate(self.audio_data, axis=0)
+        sf.write(filepath, my_recording, self.sample_rate)
+        
+        return filepath
+
+def save_attachment(source_path):
+    """Copia um arquivo selecionado para a pasta do chat"""
+    if not source_path: return None
+    
+    filename = os.path.basename(source_path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Evitar nomes duplicados
+    new_filename = f"{timestamp}_{filename}"
+    destination = os.path.join(UPLOAD_FOLDER, new_filename)
+    
+    shutil.copy2(source_path, destination)
+    return destination
+```
+
+-----
+
+### Passo 3: Alterações no `app.py`
+
+Aqui estão as mudanças necessárias no seu código principal.
+
+#### 3.1. Novos Imports
+
+No topo do `app.py`, adicione:
+
+```python
+import chat_media  # O módulo que criamos
+from tkinter import filedialog
+import subprocess # Para abrir os arquivos/áudios
+```
+
+#### 3.2. Atualizar Funções de Banco de Dados
+
+Substitua ou modifique as funções `fetch_messages` e `post_new_message` e adicione a `delete_message`.
+
+**Procure a função `fetch_messages` e substitua por esta:**
+*(Mudança: Agora buscamos o `idMensagem`, `tipo` e `caminho_arquivo`)*
+
+```python
+def fetch_messages(chat_id, current_user_id):
+    cnx = get_connection(db_name=DB_NAME)
+    if not cnx: return []
+    messages = []
+    try:
+        cursor = cnx.cursor(dictionary=True)
+        # ADICIONADO: m.idMensagem, m.tipo, m.caminho_arquivo
+        query = """
+            SELECT m.idMensagem, m.conteudo, m.dataEnvio, m.tipo, m.caminho_arquivo, 
+                   u.nome AS remetente, m.idUsuario 
+            FROM Mensagem m 
+            JOIN Usuario u ON m.idUsuario = u.idUsuario 
+            WHERE m.idChat = %s 
+            ORDER BY m.dataEnvio ASC
+        """
+        cursor.execute(query, (chat_id,))
+        messages = cursor.fetchall()
+    except mysql.connector.Error as err:
+        print(f"Erro ao buscar mensagens: {err}")
+    finally:
+        if cnx.is_connected(): cursor.close(); cnx.close()
+    return messages
+```
+
+**Procure a função `post_new_message` e substitua por esta:**
+*(Mudança: Aceita tipo e caminho do arquivo)*
+
+```python
+def post_new_message(chat_id, user_id, content, msg_type='texto', file_path=None):
+    cnx = get_connection(db_name=DB_NAME)
+    if not cnx: return False, "Erro de conexão."
+    try:
+        cursor = cnx.cursor(dictionary=True) 
+        
+        # (Lógica de segurança mantida...)
+        permitido, mensagem_status = seguranca.verificar_mensagem(cursor, chat_id, content)
+        if not permitido: return False, mensagem_status
+            
+        query = """
+            INSERT INTO Mensagem (conteudo, idUsuario, idChat, tipo, caminho_arquivo) 
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        params = (content, user_id, chat_id, msg_type, file_path)
+        cursor.execute(query, params)
+        cnx.commit()
+        return True, "Mensagem enviada."
+    except mysql.connector.Error as err:
+        cnx.rollback() 
+        return False, f"Erro ao enviar: {err}"
+    finally:
+        if cnx.is_connected(): cursor.close(); cnx.close()
+```
+
+**Adicione esta nova função logo abaixo das anteriores:**
+
+```python
+def delete_message(message_id):
+    cnx = get_connection(db_name=DB_NAME)
+    if not cnx: return False
+    try:
+        cursor = cnx.cursor()
+        cursor.execute("DELETE FROM Mensagem WHERE idMensagem = %s", (message_id,))
+        cnx.commit()
+        return True
+    except mysql.connector.Error as err:
+        print(f"Erro ao deletar: {err}")
+        return False
+    finally:
+        if cnx.is_connected(): cursor.close(); cnx.close()
+```
+
+-----
+
+#### 3.3. Atualizar a Interface (`ChatFrame`)
+
+Esta é a parte mais complexa. Vamos modificar a classe `ChatFrame` para incluir os botões e a lógica visual.
+
+**Atualize o `__init__` e adicione o inicializador do gravador:**
+
+```python
+    def __init__(self, master, user_id, user_details):
+        super().__init__(master, fg_color="transparent")
+        
+        self.user_id = user_id
+        self.user_name = user_details.get('nome', 'Usuário')
+        self.current_chat_id = None
+        self.chats_info = {} 
+        
+        # --- NOVO: Controlador de Áudio ---
+        self.recorder = chat_media.AudioRecorder()
+        self.is_recording = False
+        # ----------------------------------
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1, minsize=200) 
+        self.grid_columnconfigure(1, weight=4) 
+
+        self.create_sidebar()
+        self.create_chat_area()
+        self.load_user_chats()
+```
+
+**Atualize a função `create_chat_area` para adicionar os botões:**
+
+```python
+    def create_chat_area(self):
+        # ... (código anterior igual até chegar no input_frame) ...
+        chat_area_frame = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
+        chat_area_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=0)
+        chat_area_frame.grid_rowconfigure(1, weight=1) # area mensagens
+        
+        self.chat_title_label = ctk.CTkLabel(chat_area_frame, text="Selecione um chat...", font=ctk.CTkFont(size=16, weight="bold"), text_color=CTK_THEME_COLORS["text_dark"])
+        self.chat_title_label.grid(row=0, column=0, sticky="ew", padx=10, pady=(0, 10))
+
+        self.messages_frame = ctk.CTkScrollableFrame(chat_area_frame, fg_color=CTK_THEME_COLORS["bg_card"], corner_radius=10)
+        self.messages_frame.grid(row=1, column=0, sticky="nsew")
+        self.messages_frame.grid_columnconfigure(0, weight=1)
+
+        # --- ÁREA DE INPUT MODIFICADA ---
+        input_frame = ctk.CTkFrame(chat_area_frame, fg_color="transparent")
+        input_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        input_frame.grid_columnconfigure(0, weight=1)
+        
+        self.message_entry = ctk.CTkEntry(input_frame, placeholder_text="Digite...", height=40)
+        self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.message_entry.bind("<Return>", self.send_message_handler)
+
+        # Botão Anexar Arquivo (📎)
+        self.attach_btn = ctk.CTkButton(input_frame, text="📎", width=40, height=40, 
+                                        fg_color=CTK_THEME_COLORS["secondary"], command=self.send_file_handler)
+        self.attach_btn.grid(row=0, column=1, padx=2)
+
+        # Botão Gravar Áudio (🎤)
+        self.record_btn = ctk.CTkButton(input_frame, text="🎤", width=40, height=40, 
+                                        fg_color=CTK_THEME_COLORS["secondary"], command=self.toggle_recording)
+        self.record_btn.grid(row=0, column=2, padx=2)
+
+        # Botão Enviar
+        self.send_button = ctk.CTkButton(input_frame, text="Enviar", width=60, height=40, command=self.send_message_handler)
+        self.send_button.grid(row=0, column=3, padx=(5,0))
+```
+
+**Adicione as novas funções de lógica de envio na classe `ChatFrame`:**
+
+```python
+    def send_file_handler(self):
+        if self.current_chat_id is None: return
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            saved_path = chat_media.save_attachment(file_path)
+            # Envia como tipo 'arquivo'
+            post_new_message(self.current_chat_id, self.user_id, "Enviou um arquivo", "arquivo", saved_path)
+            self.load_messages()
+
+    def toggle_recording(self):
+        if self.current_chat_id is None: return
+        
+        if not self.is_recording:
+            # Começar a gravar
+            self.is_recording = True
+            self.recorder.start_recording()
+            self.record_btn.configure(fg_color="red", text="⏹") # Vira botão de parar
+        else:
+            # Parar e Enviar
+            self.is_recording = False
+            self.record_btn.configure(fg_color=CTK_THEME_COLORS["secondary"], text="🎤")
+            audio_path = self.recorder.stop_recording()
+            if audio_path:
+                post_new_message(self.current_chat_id, self.user_id, "Mensagem de Voz", "audio", audio_path)
+                self.load_messages()
+```
+
+**Atualize a `load_messages` para exibir os botões de download, play e a lixeira:**
+
+```python
+    def load_messages(self):
+        for widget in self.messages_frame.winfo_children():
+            widget.destroy()
+        if self.current_chat_id is None: return 
+        
+        messages = fetch_messages(self.current_chat_id, self.user_id)
+        
+        if not messages:
+            ctk.CTkLabel(self.messages_frame, text="Sem mensagens.").pack(pady=10)
+            return
+
+        for msg in messages:
+            is_own = (str(msg['idUsuario']) == str(self.user_id))
+            
+            # Configuração Visual (Direita/Esquerda)
+            if is_own:
+                anchor = "e"; justify = "right"
+                bg_color = CTK_THEME_COLORS["primary"]
+                text_color = "white"
+            else:
+                anchor = "w"; justify = "left"
+                bg_color = CTK_THEME_COLORS["bg_main"]
+                text_color = CTK_THEME_COLORS["text_dark"]
+
+            # Container da Linha (para agrupar msg + lixeira)
+            row_frame = ctk.CTkFrame(self.messages_frame, fg_color="transparent")
+            row_frame.pack(fill="x", pady=2, padx=10, anchor=anchor)
+
+            # --- Botão de Lixeira (Só aparece se for mensagem própria) ---
+            if is_own:
+                trash_btn = ctk.CTkButton(row_frame, text="🗑️", width=25, height=25, 
+                                          fg_color="transparent", text_color="red", hover_color="#fee2e2",
+                                          font=ctk.CTkFont(size=14),
+                                          command=lambda mid=msg['idMensagem']: self.delete_msg_handler(mid))
+                # Empacota ANTES do balão se estiver à direita
+                trash_btn.pack(side="left", padx=(0, 5))
+
+            # --- Balão da Mensagem ---
+            bubble = ctk.CTkFrame(row_frame, fg_color=bg_color, corner_radius=10)
+            bubble.pack(side="left" if not is_own else "right") # Se não é meu, fica na esquerda
+
+            # Cabeçalho (Nome e Hora)
+            try: time_str = msg['dataEnvio'].strftime("%H:%M")
+            except: time_str = ""
+            header_txt = f"Você ({time_str})" if is_own else f"{msg['remetente']} ({time_str})"
+            
+            ctk.CTkLabel(bubble, text=header_txt, font=ctk.CTkFont(size=10, slant="italic"), 
+                         text_color="white" if is_own else "gray").pack(padx=8, pady=(4,0), anchor="w")
+
+            # --- Conteúdo da Mensagem (Texto, Arquivo ou Áudio) ---
+            msg_type = msg.get('tipo', 'texto')
+            file_path = msg.get('caminho_arquivo')
+
+            if msg_type == 'texto':
+                wrapped = textwrap.fill(msg['conteudo'], width=50)
+                ctk.CTkLabel(bubble, text=wrapped, text_color=text_color, justify=justify).pack(padx=10, pady=5)
+            
+            elif msg_type == 'arquivo':
+                btn_text = f"📄 Arquivo: {msg['conteudo']}"
+                ctk.CTkButton(bubble, text=btn_text, fg_color="white", text_color="black", hover_color="#d1d5db",
+                              command=lambda p=file_path: self.open_file(p)).pack(padx=10, pady=5)
+            
+            elif msg_type == 'audio':
+                ctk.CTkButton(bubble, text="▶ Reproduzir Áudio", fg_color="#10b981", hover_color="#059669",
+                              command=lambda p=file_path: self.open_file(p)).pack(padx=10, pady=5)
+
+    def open_file(self, path):
+        """Abre o arquivo usando o sistema operacional"""
+        if path and os.path.exists(path):
+            try:
+                if os.name == 'nt': # Windows
+                    os.startfile(path)
+                else: # Linux/Mac
+                    subprocess.call(('xdg-open', path))
+            except Exception as e:
+                messagebox.showerror("Erro", f"Não foi possível abrir o arquivo: {e}")
+        else:
+            messagebox.showwarning("Erro", "Arquivo não encontrado (pode ter sido movido).")
+
+    def delete_msg_handler(self, msg_id):
+        if messagebox.askyesno("Confirmar", "Deseja apagar esta mensagem?"):
+            if delete_message(msg_id):
+                self.load_messages()
+            else:
+                messagebox.showerror("Erro", "Falha ao apagar.")
+```
+
+### Resumo do que fizemos:
+
+1.  **Lixeira:** Colocamos um botão 🗑️ dentro de um `row_frame` ao lado do balão da mensagem. Ele chama `delete_message` passando o ID.
+2.  **Áudio:** Criamos um botão "🎤" que alterna para "⏹" (vermelho) quando clica. Ele grava o áudio em um arquivo `.wav` e salva o caminho no banco.
+3.  **Arquivos:** O botão "📎" abre o explorador de arquivos, copia o arquivo para a pasta `chat_uploads` e salva a referência no banco.
+4.  **Visualização:** O `load_messages` agora verifica o `tipo`. Se for arquivo ou áudio, ele cria um botão que, ao ser clicado, manda o Windows abrir o arquivo (seja o player de áudio padrão ou o visualizador de pdf/imagem).
