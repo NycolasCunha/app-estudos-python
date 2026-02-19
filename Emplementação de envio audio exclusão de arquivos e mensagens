@@ -1,7 +1,6 @@
-Para implementar o envio de arquivos, gravação de áudio e exclusão de mensagens, precisaremos fazer alterações em três frentes:
 
 1.  **Banco de Dados:** Adicionar colunas para suportar tipos de mensagem (arquivo/áudio) e identificar o arquivo.
-2.  **Novo Módulo (`chat_media.py`):** Criar um arquivo separado para lidar com a lógica de gravar áudio e salvar arquivos (para não poluir seu `app.py`).
+2.  **Novo Módulo (`chat_media.py`):** Criar um arquivo separado para lidar com a lógica de gravar áudio e salvar arquivos (para não poluir `app.py`).
 3.  **Atualização no `app.py`:** Modificar a interface gráfica e as funções de banco de dados.
 
 -----
